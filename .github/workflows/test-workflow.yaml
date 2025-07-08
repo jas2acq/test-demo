@@ -26,7 +26,7 @@ jobs:
       - name: Build, tag, and push test image
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: test-demo
+          ECR_REPOSITORY: test-repo
           IMAGE_TAG: ${{ github.sha }}
         working-directory: ./test-demo2
         run: |
