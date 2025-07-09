@@ -20,9 +20,17 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
+      - name: Wait for ECS Cluster
+        run: |
+          until aws ecs describe-clusters --cluster ecommerce-data-pipeline-cluster --region eu-north-1 | grep -q '"status": "ACTIVE"'; do
+            echo "Waiting for ECS cluster ecommerce-data-pipeline-cluster to be ready..."
+            sleep 10
+          done
+          echo "ECS cluster is ready!"
+
       - name: Login to Amazon ECR Public
         run: |
-          aws ecr-public get-login-password --region us-east-1 | \
+          aws ecr-public get-login-password --region eu-north-1 | \
           docker login --username AWS --password-stdin public.ecr.aws
 
       - name: Build, tag, and push Docker image to public ECR
@@ -34,5 +42,22 @@ jobs:
         run: |
           docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+
+
+      - name: Build and push test image
+        run: |
+          docker build -t test-repo:latest -f Dockerfile.test .
+          docker tag test-repo:latest public.ecr.aws/j0g9p8r1/test-repo:latest
+          docker push public.ecr.aws/j0g9p8r1/test-repo:latest
+
+      - name: Update ECS Task Definitions
+        run: |
+          aws ecs register-task-definition --cli-input-json file://test-demo2/task-definition.json --region eu-north-1
+
+
+
+
+
+
 
 
