@@ -9,7 +9,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
-COPY test.py .
+COPY test-demo2/test.py .
 
 # Command to run the transformation service
 CMD ["python", "test.py"]
