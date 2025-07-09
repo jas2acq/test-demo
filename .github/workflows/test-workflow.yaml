@@ -46,7 +46,7 @@ jobs:
 
       - name: Build and push test image
         run: |
-          docker build -t test-repo:latest -f Dockerfile.test .
+          docker build -t test-repo:latest -f Dockerfile .
           docker tag test-repo:latest public.ecr.aws/j0g9p8r1/test-repo:latest
           docker push public.ecr.aws/j0g9p8r1/test-repo:latest
 
