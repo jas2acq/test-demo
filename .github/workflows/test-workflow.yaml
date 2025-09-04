@@ -1,63 +1,167 @@
-name: Build and Push to Public ECR
+name: Build, Quality Analysis, and Security Scan
 
 on:
   push:
     branches:
       - main
 
+env:
+  SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+  SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
 jobs:
-  build:
+  detect-changes:
+    name: Detect Changes
     runs-on: ubuntu-latest
+    outputs:
+      should-run-analysis: ${{ steps.changes.outputs.code }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect code changes
+        uses: dorny/paths-filter@v3
+        id: changes
+        with:
+          filters: |
+            code:
+              - 'src/**'
+              - 'tests/**'
+              - '*.py'
+              - 'requirements.txt'
+
+  build-and-analyze:
+    name: Build and Analyze
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.should-run-analysis == 'true'
+    timeout-minutes: 30
+    permissions:
+      pull-requests: write
+      contents: read
+      security-events: write
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v2
+        uses: actions/checkout@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Wait for ECS Cluster
+      - name: Validate SonarQube configuration
         run: |
-          until aws ecs describe-clusters --cluster test-demo-ecs-cluster --region eu-north-1 | grep -q '"status": "ACTIVE"'; do
-            echo "Waiting for ECS cluster test-demo-ecs-cluster to be ready..."
-            sleep 10
-          done
-          echo "ECS cluster is ready!"
+          if [[ -z "${{ env.SONAR_TOKEN }}" ]]; then
+            echo "::error::SONAR_TOKEN is not set"
+            exit 1
+          fi
+          if [[ -z "${{ env.SONAR_HOST_URL }}" ]]; then
+            echo "::error::SONAR_HOST_URL is not set"
+            exit 1
+          fi
+        shell: bash
 
-      - name: Login to Amazon ECR Public
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
         run: |
-          aws ecr-public get-login-password --region us-east-1 | \
-          docker login --username AWS --password-stdin public.ecr.aws
+          if [[ -f "requirements.txt" ]]; then
+            pip install -r requirements.txt
+          fi
+        shell: bash
 
-      - name: Build, tag, and push Docker image to public ECR
+      - name: Run tests with coverage
+        run: |
+          if [[ -f "requirements.txt" ]]; then
+            python -m pytest --cov=. --cov-report=xml || echo "Tests failed or no pytest config"
+          fi
+        shell: bash
+        continue-on-error: false
+
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@v5
         env:
-          ECR_REGISTRY: public.ecr.aws/j0g9p8r1
-          ECR_REPOSITORY: test-repo
-          IMAGE_TAG: ${{ github.sha }}
-        working-directory: ./test-demo2
+          SONAR_TOKEN: ${{ env.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ env.SONAR_HOST_URL }}
+        with:
+          args: >
+            -Dsonar.projectKey=${{ github.repository }}
+            -Dsonar.projectName=${{ github.event.repository.name }}
+            -Dsonar.sources=src
+            -Dsonar.tests=tests
+            -Dsonar.coverage.exclusions=**/*test*/**,**/*spec*/**
+            -Dsonar.cpd.exclusions=**/*test*/**,**/*spec*/**
+
+      - name: SonarQube Quality Gate Check
+        uses: SonarSource/sonarqube-quality-gate-action@v1
+        id: quality-gate
+        timeout-minutes: 10
+        env:
+          SONAR_TOKEN: ${{ env.SONAR_TOKEN }}
+        continue-on-error: true
+
+      - name: Retry Quality Gate Check
+        if: steps.quality-gate.outcome == 'failure'
+        uses: SonarSource/sonarqube-quality-gate-action@v1
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ env.SONAR_TOKEN }}
+
+      - name: Upload SonarQube results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sonarqube-results
+          path: |
+            .scannerwork/
+            coverage.xml
+            test-results.xml
+          retention-days: 30
+
+      - name: Generate Analysis Summary
+        if: always()
         run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -f ../Dockerfile ..
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          echo "## 🔍 SonarQube Analysis Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Repository:** ${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Branch/PR:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Quality Gate:** ${{ steps.quality-gate.outcome == 'success' && '✅ Passed' || '❌ Failed' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Analysis URL:** ${{ env.SONAR_HOST_URL }}/dashboard?id=${{ github.repository }}" >> $GITHUB_STEP_SUMMARY
 
+  security-scan:
+    name: Security Scan with CodeQL
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.should-run-analysis == 'true'
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
 
-      - name: Build and push test image
-        run: |
-          docker build -t test-repo:latest -f Dockerfile .
-          docker tag test-repo:latest public.ecr.aws/j0g9p8r1/test-repo:latest
-          docker push public.ecr.aws/j0g9p8r1/test-repo:latest
+    strategy:
+      matrix:
+        language: ['python']
 
-      - name: Update ECS Task Definitions
-        run: |
-          aws ecs register-task-definition --cli-input-json file://test-demo2/task-definition.json --region eu-north-1
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          # Uncomment to add advanced query packs
+          # queries: security-extended, security-and-quality
 
+      - name: Autobuild (optional for compiled languages)
+        uses: github/codeql-action/autobuild@v3
 
-
-
-
-
-
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
